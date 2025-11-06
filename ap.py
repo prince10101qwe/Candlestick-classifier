@@ -1,100 +1,108 @@
 import streamlit as st
 import pandas as pd
-import re
 
-st.set_page_config(page_title="Candlestick Classifier", layout="centered")
-st.title("📊 Candlestick Type Classifier (Based on Your Rules)")
+st.title("Candlestick Analyzer")
+st.write("Paste your OHLC data below (Open, High, Low, Close per line, comma or space separated).")
 
-st.markdown("### Choose Input Mode")
-mode = st.radio("Select Input Type:", ["Paste OHLC Text", "Enter Manually"])
+# Input box
+ohlc_text = st.text_area("Paste OHLC data here", 
+                         "1.2345 1.2450 1.2300 1.2400\n1.2400 1.2500 1.2380 1.2490")
 
-def classify_candle(o, h, l, c):
-    body = abs(c - o)
-    total_range = h - l
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
+if st.button("Analyze"):
+    # Parse text
+    data = []
+    for line in ohlc_text.strip().split("\n"):
+        parts = [float(x) for x in line.replace(",", " ").split()]
+        if len(parts) == 4:
+            data.append(parts)
 
-    if total_range <= 0:
-        return "Invalid", "High must be greater than Low."
+    df = pd.DataFrame(data, columns=["Open", "High", "Low", "Close"])
+    
+    results = []
 
-    body_pct = (body / total_range) * 100
-    upper_wick_pct = (upper_wick / total_range) * 100
-    lower_wick_pct = (lower_wick / total_range) * 100
+    for i, row in df.iterrows():
+        o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+        body = abs(c - o)
+        candle_range = h - l
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        body_pct = (body / candle_range) * 100 if candle_range else 0
 
-    candle_type = "Normal Candle"
-    reason = ""
+        # Candle bias
+        direction = "Bullish" if c > o else "Bearish"
 
-    # --- DOJI TYPES ---
-    if body_pct <= 10:
-        wick_diff = abs(upper_wick - lower_wick) / max(upper_wick, lower_wick, 1)
-        if wick_diff <= 0.20:
-            candle_type = "Doji"
-            reason = "Tiny body (≤10%), wicks roughly equal (≤20% diff)."
-        elif lower_wick >= 2 * body and upper_wick <= 0.1 * lower_wick:
-            candle_type = "Bullish Doji (Dragonfly)"
-            reason = "Tiny body, long lower wick ≥2× body, upper wick ≤10% of lower wick."
-        elif upper_wick >= 2 * body and lower_wick <= 0.1 * upper_wick:
-            candle_type = "Bearish Doji (Gravestone)"
-            reason = "Tiny body, long upper wick ≥2× body, lower wick ≤10% of upper wick."
+        # --- Classification logic ---
+        candle_type = "Unknown"
+        reason = ""
+        comparison = []
 
-    # --- PIN BARS ---
-    elif body_pct < 20:
-        if lower_wick >= 2 * body and (upper_wick <= body):
+        # Doji
+        if body_pct <= 10:
+            candle_type = f"{direction} Doji"
+            reason = f"Body very small ({body_pct:.1f}%), open≈close"
+            comparison = [
+                "- Not Pin Bar: wicks not 3× body",
+                "- Not Spinning Top: wick ratio ≠ equal",
+                "- Not Long Wick Rejection: wick imbalance < 3×"
+            ]
+
+        # Pin Bar (Hammer/Shooting Star)
+        elif lower_wick > body * 3 and upper_wick < body:
             candle_type = "Bullish Pin Bar"
-            reason = "Small body near top, long lower wick ≥2× body, upper wick small or none."
-        elif upper_wick >= 2 * body and (lower_wick <= body):
+            reason = "Body small (<20%), long lower wick >3× body, upper wick < body"
+            comparison = [
+                "- Not Doji: body not ≈ close (body% >10%)",
+                "- Not Long Wick Rejection: upper wick not 4× smaller than lower wick",
+                "- Not Spinning Top: body near top, wick ratio not equal"
+            ]
+        elif upper_wick > body * 3 and lower_wick < body:
             candle_type = "Bearish Pin Bar"
-            reason = "Small body near bottom, long upper wick ≥2× body, lower wick small or none."
+            reason = "Body small (<20%), long upper wick >3× body, lower wick < body"
+            comparison = [
+                "- Not Doji: body not ≈ close (body% >10%)",
+                "- Not Long Wick Rejection: lower wick not 4× smaller than upper wick",
+                "- Not Spinning Top: body near bottom, wick ratio not equal"
+            ]
 
-    # --- LONG WICK REJECTIONS ---
-    elif body_pct <= 30:
-        if lower_wick >= 2 * body and (upper_wick * 4 <= lower_wick):
-            candle_type = "Bullish Long Wick Rejection"
-            reason = "Body ≤30%, long lower wick ≥2× body, upper wick ≤¼ of lower wick."
-        elif upper_wick >= 2 * body and (lower_wick * 4 <= upper_wick):
-            candle_type = "Bearish Long Wick Rejection"
-            reason = "Body ≤30%, long upper wick ≥2× body, lower wick ≤¼ of upper wick."
+        # Long Wick Rejection
+        elif upper_wick >= lower_wick * 4 or lower_wick >= upper_wick * 4:
+            candle_type = f"{direction} Long Wick Rejection"
+            reason = "One wick ≥4× the opposite wick, showing rejection"
+            comparison = [
+                "- Not Pin Bar: both wicks not balanced for hammer pattern",
+                "- Not Doji: body% >10%",
+                "- Not Spinning Top: wick ratio highly uneven"
+            ]
 
-    # --- SPINNING TOP ---
-    elif 10 < body_pct <= 30:
-        wick_diff = abs(upper_wick - lower_wick) / max(upper_wick, lower_wick, 1)
-        if wick_diff <= 0.40:
-            candle_type = "Spinning Top"
-            reason = "Body 10–30% of range, wicks roughly equal (≤40% diff)."
+        # Spinning Top
+        elif 20 <= body_pct <= 40 and abs(upper_wick - lower_wick) / candle_range < 0.2:
+            candle_type = f"{direction} Spinning Top"
+            reason = "Body medium (20–40%), wicks roughly equal"
+            comparison = [
+                "- Not Doji: body% >10%",
+                "- Not Pin Bar: no long wick dominance",
+                "- Not Long Wick Rejection: both wicks balanced"
+            ]
+        else:
+            candle_type = f"{direction} Candle"
+            reason = "No special pattern detected"
+            comparison = [
+                "- Not Doji: body% >10%",
+                "- Not Pin Bar: wicks not 3× body",
+                "- Not Spinning Top: wick ratio not equal"
+            ]
 
-    return candle_type, reason
+        results.append({
+            "Candle #": i + 1,
+            "Candle Type": candle_type,
+            "Reason": reason,
+            "Comparison": "\n".join(comparison)
+        })
 
-
-if mode == "Paste OHLC Text":
-    st.markdown("### Paste OHLC Data (one per line)")
-    st.text("Example format:\nO3721.670 H3724.995 L3719.530 C3722.610")
-    text_data = st.text_area("Paste here:", height=200)
-
-    if st.button("🔍 Classify All"):
-        lines = text_data.strip().split("\n")
-        results = []
-        pattern = re.compile(r"O([\d.]+)\s*H([\d.]+)\s*L([\d.]+)\s*C([\d.]+)")
-
-        for line in lines:
-            match = pattern.search(line)
-            if match:
-                o, h, l, c = map(float, match.groups())
-                t, r = classify_candle(o, h, l, c)
-                results.append({"Open": o, "High": h, "Low": l, "Close": c, "Type": t, "Reason": r})
-            else:
-                results.append({"Open": None, "High": None, "Low": None, "Close": None, "Type": "Invalid Format", "Reason": "Use O,H,L,C format"})
-
-        df = pd.DataFrame(results)
-        st.dataframe(df)
-
-else:
-    st.markdown("### Enter Single Candle Manually")
-    o = st.number_input("Open", value=0.0, format="%.3f")
-    h = st.number_input("High", value=0.0, format="%.3f")
-    l = st.number_input("Low", value=0.0, format="%.3f")
-    c = st.number_input("Close", value=0.0, format="%.3f")
-
-    if st.button("🔍 Classify Candle"):
-        t, r = classify_candle(o, h, l, c)
-        st.subheader(f"🕯 Type: {t}")
-        st.write(f"Reason: {r}")
+# Display results
+    for r in results:
+        st.markdown(f"### Candle {r['Candle #']}")
+        st.write(f"Candle Type: {r['Candle Type']}")
+        st.write(f"Reason: {r['Reason']}")
+        st.text(f"Comparison:\n{r['Comparison']}")
+        st.divider()
