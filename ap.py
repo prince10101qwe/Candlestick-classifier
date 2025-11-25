@@ -1,194 +1,231 @@
-# app.py — Candlestick Identifier (Strict, Final Rules, Robust)
 import streamlit as st
 import re
 
-st.set_page_config(page_title="Candlestick Identifier — Strict Rules", layout="centered")
-st.title("Candlestick Identifier — Strict Rules + Full Comparison")
+st.set_page_config(page_title="Candlestick Identifier — Final Rules", layout="centered")
+st.title("Candlestick Identifier — FINAL UPDATED RULES (FULL LOGIC)")
 
-raw = st.text_area(
-    "Paste OHLC per line (any format). Examples:\n"
-    "O3,937.630 H3,940.880 L3,934.140 C3,937.540\n"
-    "3992.270,3994.745,3990.740,3992.195",
-    height=180,
-)
+raw = st.text_area("Paste OHLC lines:", height=180)
 show_debug = st.checkbox("Show debug metrics")
 
-# ---------------------- Final Rule Thresholds ----------------------
-DOJI_BODY_MAX = 10.0          # Doji body% 0–10
-DOJI_WICK_RATIO_MAX = 1.20    # Doji wicks roughly equal (≤20% diff)
-
-PINBAR_BODY_MAX = 20.0        # Pin Bar body% <20
-
-LWR_BODY_MAX = 30.0           # Long Wick Rejection body% ≤30
-LWR_OPP_RATIO = 0.25          # Opposite wick ≤ 1/4 of dominant
-
-SPIN_BODY_MIN = 10.0          # Spinning Top body% 10–30
-SPIN_BODY_MAX = 30.0
-SPIN_WICK_RATIO_MAX = 1.40    # Spinning wicks roughly equal (≤40% diff)
-
-# ---------------------- Parsing ----------------------
-def parse_line(line: str):
-    """Parse one line. Prefer labeled O/H/L/C in any order. Fallback: first 4 numbers."""
-    s = line.replace(",", "")  # remove thousands separators
-    # labeled capture
-    lab = {}
-    for key in ["O", "H", "L", "C", "o", "h", "l", "c"]:
-        m = re.search(key + r"\s*([-+]?\d*\.?\d+)", s)
-        if m:
-            lab[key.upper()] = float(m.group(1))
-    if all(k in lab for k in ["O", "H", "L", "C"]):
-        return lab["O"], lab["H"], lab["L"], lab["C"], line.strip()
-
-    # fallback: first 4 numbers
-    nums = re.findall(r"[-+]?\d*\.?\d+", s)
+# ===============================================================
+#               CLEAN PARSER (RELIABLE)
+# ===============================================================
+def parse_line(line):
+    s = line.strip()
+    # capture full numbers including thousands commas
+    nums = re.findall(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?", s)
+    nums = [float(x.replace(",", "")) for x in nums]
     if len(nums) >= 4:
-        o, h, l, c = map(float, nums[:4])
+        o, h, l, c = nums[:4]
         return o, h, l, c, line.strip()
     return None
 
-# ---------------------- Classifier ----------------------
+# ===============================================================
+#               BODY POSITION CHECK
+# ===============================================================
+def body_top(body_high, high, rng, pct):
+    return body_high >= (high - rng * pct)
+
+def body_bottom(body_low, low, rng, pct):
+    return body_low <= (low + rng * pct)
+
+# ===============================================================
+#               MAIN CLASSIFICATION
+# ===============================================================
 def classify(o, h, l, c):
-    # Validation
+    # INVALID CHECKS
     if l >= h:
-        return {"final": ("Invalid Candle", "LOW ≥ HIGH."), "comparison": ["All patterns skipped."], "dbg": {}}
-    big = max(abs(o), abs(h), abs(l), abs(c))
-    if big > 10_000_000:
-        return {"final": ("Invalid Candle", "Unreasonable magnitude (formatting)."), "comparison": ["Check commas/labels."], "dbg": {}}
+        return {"final": ("Invalid Candle", "LOW ≥ HIGH"), "comparison": [], "dbg": {}}
+
     rng = h - l
     if rng < 1e-9:
-        return {"final": ("Invalid Candle", "Range too small."), "comparison": ["High≈Low."], "dbg": {}}
+        return {"final": ("Invalid Candle", "Range too small"), "comparison": [], "dbg": {}}
 
-    # Metrics
     body = abs(c - o)
+    body_pct = (body / rng) * 100
     upper = h - max(o, c)
     lower = min(o, c) - l
-    body_pct = 100.0 * body / rng
-    if body_pct > 500:  # corrupted
-        return {"final": ("Invalid Candle", f"Body% {body_pct:.2f}% (corrupted input)."), "comparison": ["Range tiny or parse error."], "dbg": {}}
 
+    body_high = max(o, c)
+    body_low = min(o, c)
+
+    # wick ratio
     eps = 1e-12
     wick_ratio = max(upper, lower) / max(min(upper, lower), eps)
 
-    # Rule checks (booleans + reasons)
     results = {}
 
-    # 1) Doji (standard)
+    # ===============================================================
+    # 1. STANDARD DOJI
+    # ===============================================================
     results["Doji"] = (
-        body_pct <= DOJI_BODY_MAX and upper >= body and lower >= body and wick_ratio <= DOJI_WICK_RATIO_MAX,
-        f"body {body_pct:.2f}% ≤ {DOJI_BODY_MAX}%, upper≥body({upper:.6g}≥{body:.6g}), "
-        f"lower≥body({lower:.6g}≥{body:.6g}), wick ratio ≤{DOJI_WICK_RATIO_MAX} ({wick_ratio:.2f})"
-        if body_pct <= DOJI_BODY_MAX else f"body {body_pct:.2f}% > {DOJI_BODY_MAX}%"
+        body_pct <= 10 and
+        upper >= body and
+        lower >= body and
+        abs(upper - lower) <= 0.20 * max(upper, lower),
+        f"body {body_pct:.2f}%, wick symmetry {abs(upper-lower):.4f} ≤ 20%"
     )
 
-    # 2) Bullish Doji (Dragonfly)
+    # ===============================================================
+    # 2. BULLISH DOJI (DRAGONFLY)
+    # ===============================================================
     results["Bullish Doji (Dragonfly)"] = (
-        body_pct <= DOJI_BODY_MAX and lower >= 2.0 * body and upper <= 0.10 * lower,
-        f"body {body_pct:.2f}% ≤{DOJI_BODY_MAX}%, lower {lower:.6g} ≥ 2×body {2*body:.6g}, "
-        f"upper {upper:.6g} ≤ 10% of lower {0.1*lower:.6g}"
+        body_pct <= 10 and
+        body_top(body_high, h, rng, 0.10) and
+        lower >= 2 * body and
+        upper <= 0.10 * lower,
+        f"body {body_pct:.2f}%, lower≥2×body, upper≤10% of lower"
     )
 
-    # 3) Bearish Doji (Gravestone)
+    # ===============================================================
+    # 3. BEARISH DOJI (GRAVESTONE)
+    # ===============================================================
     results["Bearish Doji (Gravestone)"] = (
-        body_pct <= DOJI_BODY_MAX and upper >= 2.0 * body and lower <= 0.10 * upper,
-        f"body {body_pct:.2f}% ≤{DOJI_BODY_MAX}%, upper {upper:.6g} ≥ 2×body {2*body:.6g}, "
-        f"lower {lower:.6g} ≤ 10% of upper {0.1*upper:.6g}"
+        body_pct <= 10 and
+        body_bottom(body_low, l, rng, 0.10) and
+        upper >= 2 * body and
+        lower <= 0.10 * upper,
+        f"body {body_pct:.2f}%, upper≥2×body, lower≤10% of upper"
     )
 
-    # 4) Bullish Pin Bar
+    # ===============================================================
+    # 4. BULLISH PIN BAR
+    # ===============================================================
     results["Bullish Pin Bar"] = (
-        body_pct < PINBAR_BODY_MAX and lower >= 2.0 * body and upper <= body,
-        f"body {body_pct:.2f}% <{PINBAR_BODY_MAX}%, lower {lower:.6g} ≥ 2×body {2*body:.6g}, upper {upper:.6g} ≤ body {body:.6g}"
+        body_pct <= 20 and
+        body_top(body_high, h, rng, 0.20) and
+        lower >= 2 * body and
+        upper <= body,
+        f"body {body_pct:.2f}%, body near top20%, lower≥2×body, upper≤body"
     )
 
-    # 5) Bearish Pin Bar
+    # ===============================================================
+    # 5. BEARISH PIN BAR
+    # ===============================================================
     results["Bearish Pin Bar"] = (
-        body_pct < PINBAR_BODY_MAX and upper >= 2.0 * body and lower <= body,
-        f"body {body_pct:.2f}% <{PINBAR_BODY_MAX}%, upper {upper:.6g} ≥ 2×body {2*body:.6g}, lower {lower:.6g} ≤ body {body:.6g}"
+        body_pct <= 20 and
+        body_bottom(body_low, l, rng, 0.20) and
+        upper >= 2 * body and
+        lower <= body,
+        f"body {body_pct:.2f}%, body near bottom20%, upper≥2×body, lower≤body"
     )
 
-    # 6) Bullish Long Wick Rejection (LWR)
+    # ===============================================================
+    # 6. BULLISH LONG WICK REJECTION
+    # ===============================================================
     results["Bullish Long Wick Rejection"] = (
-        body_pct <= LWR_BODY_MAX and lower >= 2.0 * body and upper <= LWR_OPP_RATIO * lower,
-        f"body {body_pct:.2f}% ≤{LWR_BODY_MAX}%, lower {lower:.6g} ≥ 2×body {2*body:.6g}, upper {upper:.6g} ≤ ¼ lower {LWR_OPP_RATIO*lower:.6g}"
+        body_pct <= 30 and
+        body_top(body_high, h, rng, 0.30) and
+        lower >= 2 * body and
+        upper <= 0.26 * lower,
+        f"body {body_pct:.2f}%, body top30%, lower≥2×body, upper≤0.26×lower"
     )
 
-    # 7) Bearish Long Wick Rejection (LWR)
+    # ===============================================================
+    # 7. BEARISH LONG WICK REJECTION
+    # ===============================================================
     results["Bearish Long Wick Rejection"] = (
-        body_pct <= LWR_BODY_MAX and upper >= 2.0 * body and lower <= LWR_OPP_RATIO * upper,
-        f"body {body_pct:.2f}% ≤{LWR_BODY_MAX}%, upper {upper:.6g} ≥ 2×body {2*body:.6g}, lower {lower:.6g} ≤ ¼ upper {LWR_OPP_RATIO*upper:.6g}"
+        body_pct <= 30 and
+        body_bottom(body_low, l, rng, 0.30) and
+        upper >= 2 * body and
+        lower <= 0.26 * upper,
+        f"body {body_pct:.2f}%, body bottom30%, upper≥2×body, lower≤0.26×upper"
     )
 
-    # 8) Spinning Top
+    # ===============================================================
+    # 8. SPINNING TOP
+    # ===============================================================
     results["Spinning Top"] = (
-        (SPIN_BODY_MIN <= body_pct <= SPIN_BODY_MAX) and (upper >= body) and (lower >= body) and (wick_ratio <= SPIN_WICK_RATIO_MAX),
-        f"body {body_pct:.2f}% in [{SPIN_BODY_MIN:.0f},{SPIN_BODY_MAX:.0f}], upper≥body({upper:.6g}≥{body:.6g}), "
-        f"lower≥body({lower:.6g}≥{body:.6g}), wick ratio ≤{SPIN_WICK_RATIO_MAX} ({wick_ratio:.2f})"
-        if SPIN_BODY_MIN <= body_pct <= SPIN_BODY_MAX else f"body {body_pct:.2f}% not in [{SPIN_BODY_MIN:.0f},{SPIN_BODY_MAX:.0f}]"
+        body_pct <= 30 and
+        upper >= body and
+        lower >= body and
+        abs(upper - lower) <= 0.40 * max(upper, lower),
+        f"body {body_pct:.2f}%, both wicks≥body, wick symmetry≤40%"
     )
 
-    # Pin Bar -> LWR conversion only if LWR also matches (your rule)
-    # Implement via priority selection, not force-convert here.
+    # ===============================================================
+    # 9. STRONG CANDLE
+    # ===============================================================
+    strong = False
+    if body >= 0.85 * rng and (upper + lower <= 0.15 * rng or (upper <= 0.075 * rng and lower <= 0.075 * rng)):
+        strong = True
 
-    # Priority (strongest → weakest)
+    if strong:
+        t = "Strong Candle (Bullish)" if c > o else "Strong Candle (Bearish)"
+        results[t] = (True, f"body {body_pct:.2f}% ≥85%, wicks small")
+
+    # ===============================================================
+    # TIE-BREAK PRIORITY
+    # ===============================================================
     priority = [
-        "Bullish Doji (Dragonfly)",
-        "Bearish Doji (Gravestone)",
-        "Doji",
         "Bullish Pin Bar",
         "Bearish Pin Bar",
         "Bullish Long Wick Rejection",
         "Bearish Long Wick Rejection",
+        "Doji",
+        "Bullish Doji (Dragonfly)",
+        "Bearish Doji (Gravestone)",
         "Spinning Top",
+        "Strong Candle (Bullish)",
+        "Strong Candle (Bearish)"
     ]
 
-    # Select highest-priority match
-    final_type, final_reason = "Normal Candle", f"body {body_pct:.2f}% — no rule matched"
-    for name in priority:
-        ok, why = results[name]
-        if ok:
-            final_type, final_reason = name, why
-            break
+    final_type = "Normal Candlestick"
+    final_reason = "Does not match any rule."
 
-    # Comparison: why not others (or note lower-priority matches)
+    for name in priority:
+        if name in results:
+            ok, why = results[name]
+            if ok:
+                final_type = name
+                final_reason = why
+                break
+
     comparison = []
     for name in priority:
-        ok, why = results[name]
-        if name == final_type:
+        if name not in results:
             continue
-        if ok:
-            comparison.append(f"- {name}: matched, but lower priority than {final_type}")
-        else:
+        ok, why = results[name]
+        if name != final_type:
             comparison.append(f"- Not {name}: {why}")
 
-    dbg = dict(
-        O=o, H=h, L=l, C=c, range=rng, body=body, upper=upper, lower=lower,
-        body_pct=body_pct, wick_ratio=wick_ratio
-    )
+    dbg = {
+        "O": o, "H": h, "L": l, "C": c,
+        "range": rng, "body": body,
+        "upper": upper, "lower": lower,
+        "body%": body_pct,
+        "wick_ratio": wick_ratio,
+    }
+
     return {"final": (final_type, final_reason), "comparison": comparison, "dbg": dbg}
 
-# ---------------------- Run ----------------------
+
+# ===============================================================
+#               EXECUTION
+# ===============================================================
 if st.button("Analyze"):
-    lines = [ln for ln in raw.splitlines() if ln.strip()]
-    if not lines:
-        st.error("No input.")
-    else:
-        for i, line in enumerate(lines, 1):
-            parsed = parse_line(line)
-            st.subheader(f"Candle {i}")
-            st.caption(line.strip())
-            if not parsed:
-                st.write("**Type:** Invalid Candle")
-                st.write("**Reason:** Could not parse 4 numbers (O,H,L,C).")
-                st.write("---")
-                continue
-            o, h, l, c, orig = parsed
-            rep = classify(o, h, l, c)
-            t, why = rep["final"]
-            st.write(f"**Candle Type:** {t}")
-            st.write(f"**Reason:** {why}")
-            st.write("**Comparison:**")
-            for row in rep["comparison"]:
-                st.write(row)
-            if show_debug:
-                st.write("**Debug:**", rep["dbg"])
+    for i, line in enumerate(raw.splitlines(), start=1):
+        parsed = parse_line(line)
+        st.subheader(f"Candle {i}")
+        st.caption(line.strip())
+
+        if not parsed:
+            st.write("Invalid Input: Could not parse OHLC.")
             st.write("---")
+            continue
+
+        o, h, l, c, rawline = parsed
+        rep = classify(o, h, l, c)
+
+        t, reason = rep["final"]
+        st.write(f"**Type:** {t}")
+        st.write(f"**Reason:** {reason}")
+
+        st.write("**Comparison:**")
+        for row in rep["comparison"]:
+            st.write(row)
+
+        if show_debug:
+            st.write("**Debug:**", rep["dbg"])
+
+        st.write("---")
